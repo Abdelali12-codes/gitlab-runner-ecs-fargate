@@ -420,7 +420,7 @@ class GitLabRunnerFargateStack(Stack):
         
         # Get all private subnets and security group for Fargate config
         private_subnets = [subnet.subnet_id for subnet in self.vpc.private_subnets]
-        subnet_ids_str = '","'.join(private_subnets)
+        subnet_id_str = private_subnets[0]
         
         # User data script to install and configure GitLab Runner
         user_data = ec2.UserData.for_linux()
@@ -457,7 +457,7 @@ LogFormat = "text"
 [Fargate]
 Cluster = "{self.cluster.cluster_name}"
 Region = "{self.region}"
-Subnet = "{subnet_ids_str}"
+Subnet = "{subnet_id_str}"
 SecurityGroup = "{self.task_sg.security_group_id}"
 TaskDefinition = "{self.task_definition.family}"
 EnablePublicIP = {str(self.config.enable_public_ip).lower()}
