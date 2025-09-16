@@ -11,5 +11,12 @@
     "us-east-2a",
     "us-east-2b",
     "us-east-2c"
+  ],
+  "acknowledged-issue-numbers": [
+    34892,
+    34892,
+    32775,
+    32775,
+    31885
   ]
 }

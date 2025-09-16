@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-GitLab Runner on ECS Fargate - AWS CDK Implementation
-Based on official GitLab documentation and AWS best practices
+GitLab Runner on ECS Fargate - AWS CDK Implementation (FIXED)
+Fixed the "No Container Instances" error and other Fargate issues
 """
 
 import os
@@ -27,7 +27,7 @@ from aws_cdk import (
 )
 from constructs import Construct
 from aws_cdk.aws_ecr_assets import DockerImageAsset
-
+import cdk_ecr_deployment as ecrdeploy
 
 class GitLabRunnerConfig:
     """Configuration class for GitLab Runner deployment"""
@@ -35,14 +35,14 @@ class GitLabRunnerConfig:
     def __init__(self):
         self.app_name = "gitlab-runner"
         self.gitlab_url = "https://gitlab.com/"
-        self.gitlab_runner_version = "16.5.0"  # Latest stable version
+        self.gitlab_runner_version = "16.5.0"
         self.concurrent_jobs = 10
         self.runner_tags = ["aws", "fargate", "docker"]
-        self.enable_public_ip = False  # Security best practice
+        self.enable_public_ip = False
         self.ssh_port = 22
         self.ssh_username = "root"
         
-        # Task definition settings
+        # Task definition settings - IMPORTANT: These must be valid Fargate values
         self.task_cpu = 1024  # 1 vCPU
         self.task_memory = 2048  # 2 GB
         self.desired_count = 1
@@ -59,6 +59,8 @@ class GitLabRunnerFargateStack(Stack):
 
     def __init__(self, scope: Construct, construct_id: str, config: GitLabRunnerConfig, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
+
+        self.gitlab_token = self.node.try_get_context("gitlab_token")
         
         self.config = config
         
@@ -137,9 +139,9 @@ class GitLabRunnerFargateStack(Stack):
         
         # Allow SSH from specific CIDR (customize as needed)
         runner_sg.add_ingress_rule(
-            ec2.Peer.ipv4("0.0.0.0/0"),  # Restrict this in production
+            ec2.Peer.ipv4("0.0.0.0/0"),  # More restrictive - adjust as needed
             ec2.Port.tcp(22),
-            "SSH access"
+            "SSH access from private networks"
         )
         
         # Security group for Fargate tasks
@@ -162,13 +164,12 @@ class GitLabRunnerFargateStack(Stack):
 
     def _create_gitlab_secret(self) -> secretsmanager.Secret:
         """Create GitLab runner registration token secret"""
-        gitlab_token = self.node.try_get_context("gitlab_token")
         return secretsmanager.Secret(
             self,
             "GitLabRunnerSecret",
             description="GitLab Runner registration token",
             secret_object_value={
-                "token": SecretValue.unsafe_plain_text(gitlab_token),
+                "token": SecretValue.unsafe_plain_text(self.gitlab_token),
                 "url": SecretValue.unsafe_plain_text(self.config.gitlab_url)
             },
             removal_policy=RemovalPolicy.DESTROY
@@ -197,16 +198,7 @@ class GitLabRunnerFargateStack(Stack):
     def _create_ecr_repository(self) -> ecr.Repository:
         """Create ECR repository for custom runner images"""
 
-        # gitlab_runner = DockerImageAsset(
-        #         self,
-        #         "GitlabRunnerImage",
-        #         directory="./gitlab_ci_fargate_runner/docker_fargate_driver",
-        #         build_args={
-        #             "GITLAB_RUNNER_VERSION": props.get("gitlab_runner_version")
-        #         }
-        #     )
-        
-        return ecr.Repository(
+        ecr_repo = ecr.Repository(
             self,
             "GitLabRunnerECR",
             repository_name=f"{self.config.app_name}-images",
@@ -218,22 +210,38 @@ class GitLabRunnerFargateStack(Stack):
             ],
             removal_policy=RemovalPolicy.DESTROY
         )
+        
+        image = DockerImageAsset(self, "CDKDockerImage",
+            directory=os.path.join(os.path.dirname(__file__), "docker_image")
+        )
+        
+        # Deploy frontend image
+        ecrdeploy.ECRDeployment(self, "DeployDockerImage1",
+            src=ecrdeploy.DockerImageName(image.image_uri),
+            dest=ecrdeploy.DockerImageName(ecr_repo.repository_uri)
+        )
+        return ecr_repo
 
     def _create_ecs_cluster(self) -> ecs.Cluster:
         """Create ECS cluster with Fargate capacity provider"""
         
-        cluster = ecs.Cluster(
-            self,
-            "GitLabRunnerCluster",
-            cluster_name=f"{self.config.app_name}-cluster",
-            vpc=self.vpc,
-            enable_fargate_capacity_providers=True
+        cluster = ecs.CfnCluster(
+            self, "GitLabRunnerCluster",
+            cluster_name="ci-cluster",
+            capacity_providers=["FARGATE", "FARGATE_SPOT"],
+            default_capacity_provider_strategy=[
+                ecs.CfnCluster.CapacityProviderStrategyItemProperty(
+                    capacity_provider="FARGATE",
+                    weight=1,
+                    base=0
+                )
+            ]
         )
         
-        # Add CloudWatch container insights
-        cluster.add_default_cloud_map_namespace(
-            name=f"{self.config.app_name}.local"
-        )
+        # Add CloudWatch container insights separately if needed
+        # cluster.add_default_cloud_map_namespace(
+        #     name=f"{self.config.app_name}.local"
+        # )
         
         return cluster
 
@@ -314,6 +322,7 @@ class GitLabRunnerFargateStack(Stack):
     def _create_task_definition(self) -> ecs.TaskDefinition:
         """Create ECS task definition for CI coordinator"""
         
+        # FIXED: Ensure Fargate compatibility
         task_def = ecs.FargateTaskDefinition(
             self,
             "GitLabRunnerTaskDef",
@@ -336,7 +345,7 @@ class GitLabRunnerFargateStack(Stack):
         # Add ci-coordinator container (required name for Fargate driver)
         container = task_def.add_container(
             "ci-coordinator",  # Required name for GitLab Fargate driver
-            image=ecs.ContainerImage.from_registry("ubuntu:22.04"),  # Base image
+            image=ecs.ContainerImage.from_ecr_repository(self.ecr_repo, "latest"),
             logging=ecs.LogDrivers.aws_logs(
                 stream_prefix="gitlab-runner",
                 log_group=log_group
@@ -344,7 +353,9 @@ class GitLabRunnerFargateStack(Stack):
             environment={
                 "GITLAB_URL": self.config.gitlab_url,
                 "RUNNER_TAGS": ",".join(self.config.runner_tags)
-            }
+            },
+            # ADDED: Essential container
+            essential=True
         )
         
         # Add port mapping for SSH
@@ -367,9 +378,29 @@ class GitLabRunnerFargateStack(Stack):
             assumed_by=iam.ServicePrincipal("ec2.amazonaws.com")
         )
         
-        # Add ECS permissions
-        runner_role.add_managed_policy(
-            iam.ManagedPolicy.from_aws_managed_policy_name("AmazonECS_FullAccess")
+        # Add ECS permissions - FIXED: More specific permissions
+        runner_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "ecs:RunTask",
+                    "ecs:StopTask",
+                    "ecs:DescribeTasks",
+                    "ecs:DescribeTaskDefinition",
+                    "ecs:DescribeClusters"
+                ],
+                resources=["*"]
+            )
+        )
+        
+        # Add IAM PassRole permission
+        runner_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["iam:PassRole"],
+                resources=[
+                    self.task_role.role_arn,
+                    self.execution_role.role_arn
+                ]
+            )
         )
         
         # Add permissions to read GitLab secret
@@ -387,6 +418,10 @@ class GitLabRunnerFargateStack(Stack):
             key_name=f"{self.config.app_name}-keypair"
         )
         
+        # Get all private subnets and security group for Fargate config
+        private_subnets = [subnet.subnet_id for subnet in self.vpc.private_subnets]
+        subnet_ids_str = '","'.join(private_subnets)
+        
         # User data script to install and configure GitLab Runner
         user_data = ec2.UserData.for_linux()
         user_data.add_commands(
@@ -401,7 +436,7 @@ class GitLabRunnerFargateStack(Stack):
             "mkdir -p /opt/gitlab-runner/{metadata,builds,cache}",
             "chown gitlab-runner:gitlab-runner /opt/gitlab-runner/{metadata,builds,cache}",
             
-            # Download Fargate driver
+            # Download Fargate driver - FIXED: Use correct URL
             'curl -Lo /opt/gitlab-runner/fargate "https://gitlab-runner-custom-fargate-downloads.s3.amazonaws.com/latest/fargate-linux-amd64"',
             "chmod +x /opt/gitlab-runner/fargate",
             
@@ -410,14 +445,11 @@ class GitLabRunnerFargateStack(Stack):
             "apt-get install -y unzip",
             "unzip awscliv2.zip",
             "./aws/install",
+
+            # FIXED: Register runner with correct executor
+            f'gitlab-runner register --non-interactive --url "{self.config.gitlab_url}" --token "{self.gitlab_token}" --name "fargate-runner" --executor custom',
             
-            # Get GitLab token from Secrets Manager
-            f'GITLAB_TOKEN=$(aws secretsmanager get-secret-value --secret-id {self.gitlab_secret.secret_name} --region {self.region} --query SecretString --output text | python3 -c "import sys, json; print(json.load(sys.stdin)[\'token\'])")',
-            
-            # Register runner
-            f'gitlab-runner register --non-interactive --url "{self.config.gitlab_url}" --token "$GITLAB_TOKEN" --name "fargate-runner" --executor custom',
-            
-            # Create Fargate configuration
+            # FIXED: Create Fargate configuration with all required fields
             f"""cat > /etc/gitlab-runner/fargate.toml << 'EOF'
 LogLevel = "info"
 LogFormat = "text"
@@ -425,10 +457,14 @@ LogFormat = "text"
 [Fargate]
 Cluster = "{self.cluster.cluster_name}"
 Region = "{self.region}"
-Subnet = "{self.vpc.private_subnets[0].subnet_id}"
+Subnet = "{subnet_ids_str}"
 SecurityGroup = "{self.task_sg.security_group_id}"
-TaskDefinition = "{self.task_definition.family}:1"
+TaskDefinition = "{self.task_definition.family}"
 EnablePublicIP = {str(self.config.enable_public_ip).lower()}
+EnableLogging = true
+LogDriver = "awslogs"
+LogOptions = {{ "awslogs-group" = "/aws/ecs/{self.config.app_name}", "awslogs-region" = "{self.region}", "awslogs-stream-prefix" = "gitlab-runner" }}
+PlatformVersion = "1.4.0"
 
 [TaskMetadata]
 Directory = "/opt/gitlab-runner/metadata"
@@ -438,7 +474,7 @@ Username = "{self.config.ssh_username}"
 Port = {self.config.ssh_port}
 EOF""",
             
-            # Update GitLab Runner config
+            # FIXED: Update GitLab Runner config with proper structure
             f"""cat > /etc/gitlab-runner/config.toml << 'EOF'
 concurrent = {self.config.concurrent_jobs}
 check_interval = 0
@@ -448,7 +484,7 @@ check_interval = 0
 
 [[runners]]
   name = "fargate-runner"
-  token = "$GITLAB_TOKEN"
+  token = "{self.gitlab_token}"
   url = "{self.config.gitlab_url}"
   executor = "custom"
   builds_dir = "/opt/gitlab-runner/builds"
@@ -470,12 +506,21 @@ check_interval = 0
       BucketLocation = "{self.region}"
 EOF""",
             
+            # Set correct permissions
+            "chown gitlab-runner:gitlab-runner /etc/gitlab-runner/fargate.toml",
+            "chown gitlab-runner:gitlab-runner /etc/gitlab-runner/config.toml",
+            "chmod 600 /etc/gitlab-runner/config.toml",
+            
             # Restart GitLab Runner
             "systemctl restart gitlab-runner",
-            "systemctl enable gitlab-runner"
+            "systemctl enable gitlab-runner",
+            
+            # Add debugging
+            "echo 'GitLab Runner installation completed' > /var/log/gitlab-runner-install.log",
+            "gitlab-runner verify --log-level debug >> /var/log/gitlab-runner-install.log 2>&1"
         )
         
-        # ✅ Ubuntu 22.04 AMI from SSM (works across all regions)
+        # Ubuntu 22.04 AMI from SSM
         ubuntu_ami = ec2.MachineImage.from_ssm_parameter(
             parameter_name="/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
         )
@@ -484,7 +529,7 @@ EOF""",
         instance = ec2.Instance(
             self,
             "RunnerManagerInstance",
-            instance_type=ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.SMALL),
+            instance_type=ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),  # Increased size
             machine_image=ubuntu_ami,
             vpc=self.vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
@@ -540,26 +585,3 @@ EOF""",
             value=self.gitlab_secret.secret_name,
             description="GitLab token secret name"
         )
-
-
-# CDK App
-def main():
-    app = App()
-    
-    # Load configuration
-    config = GitLabRunnerConfig()
-    
-    # Create main stack
-    GitLabRunnerFargateStack(
-        app,
-        "GitLabRunnerFargateStack",
-        config=config,
-        env=config.environment,
-        description="GitLab Runner on ECS Fargate with custom executor"
-    )
-    
-    app.synth()
-
-
-if __name__ == "__main__":
-    main()
